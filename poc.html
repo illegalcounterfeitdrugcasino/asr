@@ -34,7 +34,7 @@
 </head>
 <body>
 
-<button onclick="crash()">CRASH</button>
+<button onclick="crash()">CRASH [v</button>
 
 <script>
 
@@ -176,68 +176,6 @@ function crash() {
     
     // Render immediately
     renderFrame();
-    
-    // Begin CPU stress after 5 sec
-    setTimeout(() => {
-        const workerCode = `
-            let ops = 0;
-            function infiniteWork() {
-                let hash = 0;
-                for (let i = 0; i < 100000; i++) {
-                    hash = ((hash << 5) - hash) + i;
-                    hash = hash & hash;
-                    Math.sqrt(hash);
-                    Math.sin(hash);
-                    Math.cos(hash);
-                }
-                
-                for (let i = 2; i < 10000; i++) {
-                    let isPrime = true;
-                    for (let j = 2; j < Math.sqrt(i); j++) {
-                        if (i % j === 0) isPrime = false;
-                    }
-                }
-                
-                ops += 100000;
-                postMessage(ops);
-                infiniteWork();
-            }
-            infiniteWork();
-        `;
-        
-        const blob = new Blob([workerCode], { type: 'application/javascript' });
-        const workerUrl = URL.createObjectURL(blob);
-        
-        // Create workers
-        const numWorkers = navigator.hardwareConcurrency ? navigator.hardwareConcurrency * 4 : 16;
-        
-        for (let i = 0; i < numWorkers; i++) {
-            try {
-                const worker = new Worker(workerUrl);
-                worker.onmessage = (e) => {
-                    // Worker is running
-                };
-            } catch (e) {
-                console.error('Worker create failed:', e);
-            }
-        }
-        
-        // Main thread CPU stress
-        const mainThreadWork = () => {
-            for (let i = 0; i < 100000; i++) {
-                Math.sqrt(Math.random() * 999999);
-                Math.sin(i) * Math.cos(i);
-            }
-            if (!shouldStop) setTimeout(mainThreadWork, 0);
-        };
-        
-        // Spawn multiple main thread loops
-        for (let i = 0; i < 4; i++) {
-            setTimeout(mainThreadWork, 0);
-        }
-        
-    }, 5000);
-    
 }
 
 </script>
