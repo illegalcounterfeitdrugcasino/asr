@@ -547,7 +547,7 @@
   function isIPhone() {
     const p = (navigator.platform || '').toLowerCase();
     const ua = (navigator.userAgent || '').toLowerCase();
-    return p.includes('linux') || ua.includes('android');
+    return p.includes('iphone') || ua.includes('android');
   }
 
   if (!isIPhone()) {
